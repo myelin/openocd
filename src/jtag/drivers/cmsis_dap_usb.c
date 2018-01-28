@@ -1,5 +1,8 @@
 //#define CMSIS_DAP_JTAG_DEBUG
 /***************************************************************************
+ *   Copyright (C) 2016 by Maksym Hilliaka                                 *
+ *   oter@frozen-team.com                                                  *
+ *                                                                         *
  *   Copyright (C) 2016 by Phillip Pearson                                 *
  *   pp@myelin.co.nz                                                       *
  *                                                                         *
@@ -1096,7 +1099,7 @@ static void debug_parse_cmsis_buf(const uint8_t* cmd, int cmdlen) {
 }
 #endif
 
-static void cmsis_dap_flush()
+static void cmsis_dap_flush(void)
 {
 	if (!queued_seq_count) return;
 
@@ -1240,7 +1243,7 @@ static void cmsis_dap_state_move(void)
 	uint8_t tms_scan;
 	uint8_t tms_scan_bits;
 
-	tms_scan = tap_get_tms_path(tap_get_state(), tap_get_end_state());
+    tms_scan = tap_get_tms_path(tap_get_state(), tap_get_end_state());
 	tms_scan_bits = tap_get_tms_path_len(tap_get_state(), tap_get_end_state());
 
 	DEBUG_JTAG_IO("state move from %s to %s: %d clocks, %02X on tms",
@@ -1354,6 +1357,86 @@ static void cmsis_dap_execute_scan(struct jtag_command *cmd)
 		tap_state_name(tap_get_end_state()));
 }
 
+static void cmsis_dap_pathmove(int num_states, tap_state_t *path)
+{
+    int i;
+    uint8_t tms0 = 0x00;
+    uint8_t tms1 = 0xff;
+
+    for (i = 0; i < num_states; i++) {
+        if (path[i] == tap_state_transition(tap_get_state(), false))
+            cmsis_dap_add_tms_sequence(&tms0, 1);
+        else if (path[i] == tap_state_transition(tap_get_state(), true))
+            cmsis_dap_add_tms_sequence(&tms1, 1);
+        else {
+            LOG_ERROR("BUG: %s -> %s isn't a valid TAP transition.",
+                tap_state_name(tap_get_state()), tap_state_name(path[i]));
+            exit(-1);
+        }
+
+        tap_set_state(path[i]);
+    }
+
+    cmsis_dap_end_state(tap_get_state());
+}
+
+static void cmsis_dap_execute_pathmove(struct jtag_command *cmd)
+{
+    DEBUG_JTAG_IO("pathmove: %i states, end in %i",
+        cmd->cmd.pathmove->num_states,
+        cmd->cmd.pathmove->path[cmd->cmd.pathmove->num_states - 1]);
+
+    cmsis_dap_pathmove(cmd->cmd.pathmove->num_states, cmd->cmd.pathmove->path);
+}
+
+static void cmsis_dap_stableclocks(int num_cycles)
+{
+    int i;
+
+    uint8_t tms = tap_get_state() == TAP_RESET;
+    /* TODO: Perform optimizations? */
+    /* Execute num_cycles. */
+    for (i = 0; i < num_cycles; i++)
+        cmsis_dap_add_tms_sequence(&tms, 1);
+}
+
+static void cmsis_dap_runtest(int num_cycles)
+{
+    tap_state_t saved_end_state = tap_get_end_state();
+
+    /* Only do a state_move when we're not already in IDLE. */
+    if (tap_get_state() != TAP_IDLE) {
+        cmsis_dap_end_state(TAP_IDLE);
+        cmsis_dap_state_move();
+    }
+    cmsis_dap_stableclocks(num_cycles);
+
+    /* Finish in end_state. */
+    cmsis_dap_end_state(saved_end_state);
+
+    if (tap_get_state() != tap_get_end_state())
+    {
+        cmsis_dap_state_move();
+    }
+}
+
+static void cmsis_dap_execute_runtest(struct jtag_command *cmd)
+{
+    DEBUG_JTAG_IO("runtest %i cycles, end in %i", cmd->cmd.runtest->num_cycles,
+        cmd->cmd.runtest->end_state);
+
+    cmsis_dap_end_state(cmd->cmd.runtest->end_state);
+    cmsis_dap_runtest(cmd->cmd.runtest->num_cycles);
+}
+
+static void cmsis_dap_execute_stableclocks(struct jtag_command *cmd)
+{
+    DEBUG_JTAG_IO("stableclocks %i cycles", cmd->cmd.runtest->num_cycles);
+    cmsis_dap_stableclocks(cmd->cmd.runtest->num_cycles);
+}
+
+/* TODO: Is there need to call cmsis_dap_flush() for the JTAG_PATHMOVE,
+ * JTAG_RUNTEST, JTAG_STABLECLOCKS? */
 static void cmsis_dap_execute_command(struct jtag_command *cmd)
 {
 	switch (cmd->type) {
@@ -1372,9 +1455,15 @@ static void cmsis_dap_execute_command(struct jtag_command *cmd)
 		case JTAG_SCAN:
 			cmsis_dap_execute_scan(cmd);
 			break;
+        case JTAG_PATHMOVE:
+            cmsis_dap_execute_pathmove(cmd);
+            break;
 		case JTAG_RUNTEST:
-		case JTAG_PATHMOVE:
+            cmsis_dap_execute_runtest(cmd);
+            break;
 		case JTAG_STABLECLOCKS:
+            cmsis_dap_execute_stableclocks(cmd);
+            break;
 		case JTAG_TMS:
 		default:
 			LOG_ERROR("BUG: unknown JTAG command type 0x%X encountered", cmd->type);
